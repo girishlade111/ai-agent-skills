@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ ! -f .wednesday/codebase/dep-graph.json ]; then exit 0; fi\nwednesday-skills analyze --incremental --silent 2>/dev/null &\ntrue"
+          }
+        ]
+      }
+    ]
+  }
+}

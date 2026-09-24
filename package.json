@@ -1,0 +1,67 @@
+{
+  "name": "@wednesday-solutions-eng/ai-agent-skills",
+  "version": "2.0.0",
+  "description": "AI agent skills for Wednesday Solutions — git discipline, PR triage, terminal dashboard, and greenfield planning.",
+  "keywords": [
+    "agent-skills",
+    "claude",
+    "gemini",
+    "antigravity",
+    "cursor",
+    "ai",
+    "coding-assistant",
+    "code-quality",
+    "design-system",
+    "wednesday-solutions",
+    "conventional-commits",
+    "pr-triage",
+    "greenfield-planning"
+  ],
+  "author": "Wednesday Solutions <delivery@wednesday.is>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wednesday-solutions/ai-agent-skills.git"
+  },
+  "homepage": "https://github.com/wednesday-solutions/ai-agent-skills#readme",
+  "bugs": {
+    "url": "https://github.com/wednesday-solutions/ai-agent-skills/issues"
+  },
+  "bin": {
+    "wednesday-skills": "./bin/cli.js",
+    "ws-skills": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "skills/",
+    "scripts/",
+    "src/",
+    "assets/",
+    ".commitlintrc.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.0.2",
+    "better-sqlite3": "^12.8.0",
+    "fast-glob": "^3.3.3",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "ink": "^4.4.1",
+    "react": "^18.2.0"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.0.0",
+    "@commitlint/config-conventional": "^19.0.0",
+    "dotenv": "^17.3.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/**/*.test.js"
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "version": "1.0",
+  "updatedAt": "2026-05-26T07:49:28.980Z",
+  "count": 10,
+  "skills": [
+    {
+      "name": "brownfield-drift",
+      "version": "1.0.0",
+      "description": "Enforces architecture boundaries defined in PLAN.md. Use when a PR crosses module/service boundaries, when the dev asks \"are we following the architecture?\", or as a scheduled architecture health check. Not for querying what a module does — use brownfield-chat for that.",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 390,
+      "downloads": 0,
+      "path": "skills/brownfield-drift"
+    },
+    {
+      "name": "codebase-intel",
+      "version": "1.0.0",
+      "description": "Unified codebase intelligence. Handles all questions about structure, logic, risk, and dependencies. Combines natural-language Q&A with deterministic lookups and pre-edit blast radius checks.",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 527,
+      "downloads": 0,
+      "path": "skills/codebase-intel"
+    },
+    {
+      "name": "deploy-checklist",
+      "version": "1.0.0",
+      "description": "Pre-deploy and post-deploy checklist skill. Ensures env vars, migrations, CI, rollback plan, smoke tests, and monitoring are verified before and after every deployment.",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 474,
+      "downloads": 0,
+      "path": "skills/deploy-checklist"
+    },
+    {
+      "name": "greenfield",
+      "version": "1.0.0",
+      "description": "Parallel persona planning for new projects. Research agent runs first to build domain context, then Architect, PM, and Security agents run in parallel. Synthesis agent combines all perspectives into a detailed GSD-style PLAN.md with Tensions section.",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 547,
+      "downloads": 0,
+      "path": "skills/greenfield"
+    },
+    {
+      "name": "module-audit-agent",
+      "version": "1.0.0",
+      "description": "Use when asked to audit a module, check its health, or assess whether it should be refactored. Runs structural query, risk check, and test generation automatically.",
+      "tags": [],
+      "requires": [
+        "brownfield-chat",
+        "brownfield-fix"
+      ],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 261,
+      "downloads": 0,
+      "path": "skills/agents/module-audit"
+    },
+    {
+      "name": "onboard-dev-agent",
+      "version": "1.0.0",
+      "description": "Use when a dev is new to the project, asks for an overview, or wants to get oriented quickly. Fills graph gaps then runs a guided codebase interview.",
+      "tags": [],
+      "requires": [
+        "brownfield-fix",
+        "brownfield-chat"
+      ],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 281,
+      "downloads": 0,
+      "path": "skills/agents/onboard-dev"
+    },
+    {
+      "name": "pr-review",
+      "version": "1.0.0",
+      "description": "Fix engine for PR review comments. Fetches review comments (Gemini bot or human), categorizes by impact, posts a prioritized fix queue, and applies fixes on dev approval. Called directly for quick fixes, or internally by pr-review-agent as part of full PR review.",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 475,
+      "downloads": 0,
+      "path": "skills/pr-review"
+    },
+    {
+      "name": "pr-review-agent",
+      "version": "1.0.0",
+      "description": "Full PR review orchestrator. Use when asked to review a PR or check if it is ready to merge. Runs blast radius + drift check on changed files, then hands off to pr-review for comment triage and fixes. Do NOT use pr-review directly for full reviews — use this.",
+      "tags": [],
+      "requires": [
+        "brownfield-fix",
+        "brownfield-drift",
+        "pr-review"
+      ],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 303,
+      "downloads": 0,
+      "path": "skills/agents/pr-review-agent"
+    },
+    {
+      "name": "standards-kit",
+      "version": "1.0.0",
+      "description": "Unified development and design standards. Enforces code quality (complexity < 8), strict naming conventions, and the mandatory use of approved UI component libraries.",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 239,
+      "downloads": 0,
+      "path": "skills/standards-kit"
+    },
+    {
+      "name": "wednesday-git",
+      "version": "1.0.0",
+      "description": "Unified Git workflow. Manages the entire task lifecycle: branch creation (sprint), atomic commits (git-os), and PR opening (pr-create).",
+      "tags": [],
+      "requires": [],
+      "conflicts": [],
+      "author": "wednesday-solutions",
+      "license": "MIT",
+      "wordCount": 403,
+      "downloads": 0,
+      "path": "skills/wednesday-git"
+    }
+  ]
+}

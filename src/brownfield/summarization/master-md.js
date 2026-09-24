@@ -1,0 +1,1304 @@
+/**
+ * 2C-2 — MASTER.md generator
+ * Comprehensive per-file documentation. Every file gets full detail.
+ * Writes .wednesday/codebase/MASTER.md
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { callLLM } = require('../core/llm-client');
+const { detectFeatureModules } = require('../analysis/feature-modules');
+const { scoreAll } = require('../analysis/safety-scorer');
+const { findDeadCode, findCircularDeps } = require('../analysis/dead-code');
+const { blastRadius } = require('../analysis/blast-radius');
+const { extractIosMetadata } = require('../analysis/ios-metadata');
+const { detectEntryPoints } = require('../analysis/entry-point-detector');
+
+function groupByDir(allNodes) {
+  const byDir = {};
+  for (const [file, node] of allNodes) {
+    const dir = path.dirname(file) === '.' ? '(root)' : path.dirname(file);
+    byDir[dir] = byDir[dir] || [];
+    byDir[dir].push([file, node]);
+  }
+  return byDir;
+}
+
+function groupByCommunity(allNodes, store) {
+  if (!store) return null;
+  const communities = store.getCommunities();
+  if (Object.keys(communities).length === 0) return null;
+
+  const nodesMap = Object.fromEntries(allNodes);
+  const grouped = {};
+  
+  for (const [cid, files] of Object.entries(communities)) {
+    const members = files
+      .map(f => [f, nodesMap[f]])
+      .filter(([, n]) => !!n);
+    
+    if (members.length > 0) {
+      grouped[cid] = members;
+    }
+  }
+  return grouped;
+}
+
+// ── Package manifest readers ──────────────────────────────────────────────────
+function readPackageJson(rootDir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+  } catch { return null; }
+}
+
+// ── Feature domain inference from file names ──────────────────────────────────
+const DOMAIN_PATTERNS = [
+  { domain: 'Authentication',     patterns: /auth|login|logout|signin|signup|register|password|token|otp|biometric/i },
+  { domain: 'User / Profile',     patterns: /user|profile|account|avatar|settings|preference/i },
+  { domain: 'Home / Dashboard',   patterns: /home|dashboard|feed|landing|main|root|sqwid|post|details|list|tabbar|tab|scene|screen|controller|ar|arkit|camera/i },
+  { domain: 'Payments / Billing', patterns: /payment|billing|checkout|cart|order|invoice|subscription|stripe|razorpay|purchase/i },
+  { domain: 'Notifications',      patterns: /notif|alert|push|apns|fcm|badge/i },
+  { domain: 'Onboarding',         patterns: /onboard|walkthrough|splash|intro|tutorial/i },
+  { domain: 'Search',             patterns: /search|filter|sort|discover/i },
+  { domain: 'Messaging / Chat',   patterns: /chat|message|inbox|conversation|thread/i },
+  { domain: 'Media',              patterns: /camera|photo|video|image|gallery|media|upload/i },
+  { domain: 'Map / Location',     patterns: /map|location|geo|coordinates|nearby/i },
+  { domain: 'Analytics',          patterns: /analytics|tracking|event|segment|mixpanel|amplitude/i },
+  { domain: 'API / Networking',   patterns: /api|network|http|request|response|endpoint|graphql/i },
+  { domain: 'Storage / Database', patterns: /storage|database|db|cache|persist|realm|coredata|sqlite/i },
+];
+
+function inferFeatures(allNodes) {
+  const domains = {};
+  for (const [file] of allNodes) {
+    const base = path.basename(file, path.extname(file)).toLowerCase();
+    for (const { domain, patterns } of DOMAIN_PATTERNS) {
+      if (patterns.test(base) || patterns.test(file)) {
+        domains[domain] = domains[domain] || [];
+        if (!domains[domain].includes(base)) domains[domain].push(base);
+      }
+    }
+  }
+  return domains;
+}
+
+// ── Tech stack builder ────────────────────────────────────────────────────────
+function buildTechStack(allNodes, pkgJson, stats, frameworks, graphPackages) {
+  const stack = { languages: [], frameworks: [], libraries: [], platform: null };
+
+  const KEY_LIBS = [
+    'react', 'react-native', 'next', 'express', 'fastify', 'koa', 'nestjs',
+    'graphql', 'apollo', 'prisma', 'typeorm', 'sequelize', 'mongoose',
+    'redux', 'zustand', 'mobx', 'recoil', 'jotai',
+    'axios', 'swr', 'react-query', '@tanstack/query',
+    'jest', 'vitest', 'mocha', 'cypress', 'playwright',
+    'tailwindcss', 'styled-components', '@emotion',
+    'stripe', 'twilio', 'sendgrid', 'firebase', 'supabase',
+    'aws-sdk', '@aws-sdk', 'socket.io', 'ws',
+    'lottie', 'kingfisher', 'cloudinary', 'iqkeyboardmanagerswift',
+    'googlesignin', 'facebooksdk', 'cluster', 'mapkit', 'arkit', 'siren', 'alamofire', 'stepfun',
+    'coredata', 'linkpresentation', 'firebaseanalytics', 'firebasecrashlytics', 'firebasemessaging',
+    'corelocation', 'arkit', 'mapkit', 'swiftui', 'uikit', 'appkit', 'combine'
+  ];
+
+  // Languages...
+  const langs = Object.entries(stats.byLang || {}).sort((a, b) => b[1] - a[1]);
+  for (const [l] of langs) stack.languages.push(l.charAt(0).toUpperCase() + l.slice(1));
+
+  // Platform...
+  if (frameworks.has('SwiftUI') || frameworks.has('UIKit')) {
+    stack.platform = 'iOS';
+  } else if (stats.byLang?.kotlin) {
+    stack.platform = 'Android';
+  } else if (frameworks.has('React Native')) {
+    stack.platform = 'React Native (iOS + Android)';
+  } else if (frameworks.has('Next.js')) {
+    stack.platform = 'Web (Next.js)';
+  } else if (frameworks.has('React')) {
+    stack.platform = 'Web (React)';
+  } else if (stats.byLang?.go) {
+    stack.platform = 'Backend (Go)';
+  } else if (frameworks.has('NestJS')) {
+    stack.platform = 'Backend (NestJS)';
+  }
+
+  // Aggregate frameworks from meta
+  for (const f of frameworks) stack.frameworks.push(f);
+
+  // Deep scan imports for key libraries if not in pkgJson
+  const allDeps = pkgJson ? { ...pkgJson.dependencies, ...pkgJson.devDependencies } : {};
+  if (graphPackages?.ios) {
+    if (graphPackages.ios.cocoapods?.pods) graphPackages.ios.cocoapods.pods.forEach(p => allDeps[p.toLowerCase()] = 'latest');
+    if (graphPackages.ios.spm?.packages) graphPackages.ios.spm.packages.forEach(p => allDeps[p.name.toLowerCase()] = 'latest');
+  }
+
+  // Scan every node's imports for key frameworks
+  const importedFrameworks = new Set();
+  for (const [, n] of allNodes) {
+    if (!n.imports) continue;
+    for (const imp of n.imports) {
+      const lower = imp.toLowerCase();
+      // Check if import starts with a key lib name (common in Node and iOS)
+      const found = KEY_LIBS.find(lib => lower === lib || lower.startsWith(`${lib}/`));
+      if (found) importedFrameworks.add(found);
+    }
+  }
+
+  for (const lib of KEY_LIBS) {
+    if (allDeps[lib] || importedFrameworks.has(lib)) {
+      const display = lib.charAt(0).toUpperCase() + lib.slice(1);
+      if (!stack.libraries.includes(display)) stack.libraries.push(display);
+    }
+  }
+
+  stack.languages = [...new Set(stack.languages)].sort();
+  stack.frameworks = [...new Set(stack.frameworks)].sort();
+  stack.libraries = [...new Set(stack.libraries)].sort();
+
+  return stack;
+}
+
+function buildTestCoverageMap(nodes) {
+  const coverageMap = {};
+  const TEST_RE = /\.test\.[jt]sx?$|\.spec\.[jt]sx?$|__tests__|Tests\.swift$|Spec\.swift$|UITests\.swift$|\/Tests\/|_test\.go$|Test\.kt$|\/androidTest\//;
+  for (const file of Object.keys(nodes)) {
+    if (!TEST_RE.test(file)) coverageMap[file] = 0;
+  }
+  for (const [file, node] of Object.entries(nodes)) {
+    if (!TEST_RE.test(file)) continue;
+    for (const imp of node.imports) {
+      if (Object.prototype.hasOwnProperty.call(coverageMap, imp)) coverageMap[imp] = 100;
+    }
+  }
+  return coverageMap;
+}
+
+function isHighValue(node) {
+  return node.isEntryPoint || node.importedBy.length > 10 || node.riskScore > 70;
+}
+
+// ── Mode 0: Skeleton for unmapped codebase ────────────────────────────────────
+function generateMode0Skeleton(rootDir, pkgJson) {
+  const projectName = pkgJson?.name || path.basename(rootDir) || 'Project';
+  const mainField = pkgJson?.main || '';
+  const desc = pkgJson?.description || '';
+
+  const lines = [];
+  lines.push(`# ${projectName} — Codebase Intelligence`);
+  lines.push('');
+  lines.push('> ⚠️ **Not yet analyzed.** This document is a skeleton template.');
+  lines.push('');
+  lines.push('To generate comprehensive intelligence about your codebase:');
+  lines.push('');
+  lines.push('```bash');
+  lines.push('wednesday-skills map --full');
+  lines.push('```');
+  lines.push('');
+  lines.push('(Takes 2-5 minutes on first run.)');
+  lines.push('');
+
+  if (desc) {
+    lines.push('## What This Does');
+    lines.push('');
+    lines.push(desc);
+    lines.push('');
+  }
+
+  if (mainField) {
+    lines.push('## Quick Start');
+    lines.push('');
+    lines.push(`Entry point (from package.json): \`${mainField}\``);
+    lines.push('');
+    lines.push(`Read this file first, then follow its imports to understand the codebase.`);
+    lines.push('');
+  }
+
+  lines.push('## Getting Help');
+  lines.push('');
+  lines.push('- **Understand a file:** Use `/brownfield-chat "what does X do?"`');
+  lines.push('- **Check edit risk:** Use `/brownfield-fix <filename>`');
+  lines.push('- **See change impact:** Use `/brownfield-blast <filename>`');
+  lines.push('- **Update this doc:** Run `wednesday-skills map --full`');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+// ── Generate reading order from entry point ────────────────────────────────────
+function generateReadingOrder(entryFile, nodes, flows, limit = 10) {
+  const visited = new Set();
+  const order = [];
+
+  // Start with entry point
+  if (entryFile && nodes[entryFile]) {
+    order.push(entryFile);
+    visited.add(entryFile);
+  }
+
+  // Add files from flows
+  if (flows && flows.length > 0) {
+    for (const flow of flows) {
+      const parts = flow.path?.split(' -> ') || [];
+      for (const part of parts) {
+        if (!visited.has(part) && order.length < limit) {
+          order.push(part);
+          visited.add(part);
+        }
+      }
+    }
+  }
+
+  // Fill remaining slots with high-fanin files not yet added
+  if (order.length < limit) {
+    const candidates = Object.entries(nodes)
+      .filter(([f]) => !visited.has(f) && nodes[f].importedBy?.length > 3)
+      .sort((a, b) => (b[1].importedBy?.length || 0) - (a[1].importedBy?.length || 0))
+      .slice(0, limit - order.length)
+      .map(([f]) => f);
+    order.push(...candidates);
+  }
+
+  return order.slice(0, limit);
+}
+
+// ── Confidence label helper ────────────────────────────────────────────────────
+function confidenceLabel(confidence) {
+  if (confidence >= 80) return 'HIGH';
+  if (confidence >= 50) return 'MODERATE';
+  return 'LOW';
+}
+
+// ── Deterministic product orientation fallback ────────────────────────────────
+function generateDeterministicOrientation(pkgJson, stack, stats) {
+  const lines = [];
+
+  if (pkgJson?.description) {
+    lines.push(pkgJson.description);
+  } else {
+    const langList = stack.languages.join(', ');
+    const platform = stack.platform || 'Unknown';
+    lines.push(`${platform} project written in ${langList}. Contains ${stats.totalFiles} files across ${Object.keys(stats.byLang || {}).length} language(s).`);
+  }
+
+  if (stack.frameworks?.length > 0) {
+    lines.push(``);
+    lines.push(`**Tech stack:** ${stack.frameworks.join(', ')}`);
+  }
+
+  return lines.join('\n') || 'A software project.';
+}
+
+/**
+ * Generate full MASTER.md — every file documented in detail
+ */
+async function generateMasterMd(graph, summaries, legacyReport, codebaseDir, apiKey, commentIntel = null, gapsFilled = 0, elapsed = 0, insights = {}, store = null, daemonData = null, adapterData = null) {
+  const nodes = graph.nodes;
+  const allNodes = Object.entries(nodes).filter(([, n]) => !n.error);
+
+  // ── Mode 0: No graph / unmapped codebase ──────────────────────────────────
+  if (allNodes.length === 0) {
+    const skeleton = generateMode0Skeleton(graph.rootDir, readPackageJson(graph.rootDir));
+    const outPath = path.join(codebaseDir, 'MASTER.md');
+    fs.mkdirSync(codebaseDir, { recursive: true });
+    fs.writeFileSync(outPath, skeleton);
+    return outPath;
+  }
+
+  // Pre-compute derived data used by multiple sections
+  const scoreMap = store ? store.getScoreMap() : scoreAll(nodes, buildTestCoverageMap(nodes), commentIntel);
+  const deadData = store ? store.getDeadCode() : findDeadCode(nodes, commentIntel);
+  const { deadFiles, unusedExports } = deadData;
+  const rootDir    = graph.rootDir || '';
+  const features   = inferFeatures(allNodes);
+  const deadClassification = insights.deadClassification || {};
+  const cycleBreakPoints   = insights.cycleBreakPoints   || {};
+  
+  const stats = store ? store.getStats() : graph.stats;
+  const totalGaps = stats.gapCount || 0;
+
+  // Build comment intel lookup by dir
+  const commentByDir = new Map();
+  if (commentIntel && commentIntel.modules) {
+    for (const mod of commentIntel.modules) commentByDir.set(mod.dir, mod);
+  }
+
+  const communityGroup = groupByCommunity(allNodes, store);
+
+  const pkgJson    = readPackageJson(graph.rootDir);
+  const frameworks = new Set(allNodes.map(([, n]) => n.meta?.framework).filter(Boolean));
+  const stack      = buildTechStack(allNodes, pkgJson, graph.stats, frameworks, graph.packages);
+
+  // ── LLM path — if API key available, generate the whole document in one call ──
+  if (apiKey) {
+    const { discoverPrimaryFlows } = require('../analysis/flow-discovery');
+    const flows = store ? discoverPrimaryFlows(store, 5, 4) : [];
+    const graphCoverage = graph.stats?.coverage || 0;
+    const entryPointsDetected = detectEntryPoints(nodes, pkgJson, graphCoverage);
+    const ctx = buildCompactContext(
+      graph, summaries, scoreMap, deadFiles, unusedExports,
+      daemonData, adapterData, features, legacyReport, flows, insights, stack, entryPointsDetected,
+      communityGroup
+    );
+
+    let llmContent = null;
+    try {
+      llmContent = await generateWithLlm(ctx, new Date().toISOString());
+    } catch { /* fall through to template */ }
+
+    if (llmContent && llmContent.length > 200) {
+      const outPath = path.join(codebaseDir, 'MASTER.md');
+      fs.mkdirSync(codebaseDir, { recursive: true });
+      fs.writeFileSync(outPath, llmContent);
+      return outPath;
+    }
+  }
+
+  // ── Template fallback (no API key or LLM failed) ───────────────────────────
+  const lines = [];
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  lines.push(`# Codebase Intelligence — MASTER.md`);
+  lines.push(`> Generated: ${new Date().toISOString()} · Root: \`${graph.rootDir}\``);
+  lines.push('');
+
+  // ── Product orientation (AI-generated from features/signatures) ────────────
+  let productOrientation = null;
+  if (apiKey) {
+    try {
+      productOrientation = await callHaikuProductOrientation(features, sampleRepresentativeNodes(nodes, 30, store));
+    } catch {
+      // LLM call failed, use fallback
+    }
+  }
+  if (!productOrientation) {
+    // Use deterministic fallback
+    productOrientation = generateDeterministicOrientation(pkgJson, stack, graph.stats);
+  }
+  lines.push('## Product orientation');
+  lines.push('');
+  lines.push(`${productOrientation}`);
+  lines.push('');
+
+  // ── Codebase health (AI narrative) ────────────────────────────────────────
+  if (insights.healthNarrative) {
+    lines.push('## Codebase health');
+    lines.push('');
+    lines.push(`> ${insights.healthNarrative}`);
+    lines.push('');
+  }
+
+  // ── Health snapshot ────────────────────────────────────────────────────────
+  const logicCycles = (legacyReport?.circularDeps || []).filter(c => c.type === 'Logic').length;
+  const structuralCycles = (legacyReport?.circularDeps || []).filter(c => c.type === 'Structural').length;
+
+  // Risk band distribution
+  const bands = { critical: 0, risky: 0, moderate: 0, safe: 0 };
+  for (const s of Object.values(scoreMap)) {
+    const b = s.band?.toLowerCase();
+    if (b && bands[b] !== undefined) bands[b]++;
+  }
+  const bandStr = [
+    bands.critical ? `🔴 ${bands.critical} critical` : '',
+    bands.risky    ? `🟠 ${bands.risky} risky`       : '',
+    bands.moderate ? `🟡 ${bands.moderate} moderate`  : '',
+    bands.safe     ? `🟢 ${bands.safe} safe`          : '',
+  ].filter(Boolean).join('  ');
+
+  const unusedExportCount = Object.keys(unusedExports || {}).length;
+
+  lines.push('| Metric | Value |');
+  lines.push('|--------|-------|');
+  lines.push(`| Files | ${stats.totalFiles} mapped · ${stats.totalEdges} edges |`);
+  lines.push(`| Risk bands | ${bandStr || `${stats.highRiskFiles} high-risk`} |`);
+  lines.push(`| Dead | ${deadFiles.length} files · ${unusedExportCount} unused exports |`);
+  lines.push(`| Circular deps | ${logicCycles} logic · ${structuralCycles} structural |`);
+  lines.push(`| God files | ${legacyReport?.godFiles?.length || 0} |`);
+  if (daemonData)  lines.push(`| Background processes | ${daemonData.total} patterns · ${Object.keys(daemonData.byKind || {}).length} kinds |`);
+  if (adapterData) lines.push(`| External adapters | ${adapterData.total} · ${Object.keys(adapterData.byKind || {}).length} categories |`);
+  if (stats.gapCount > 0) lines.push(`| Coverage gaps | ${stats.gapCount}${gapsFilled ? ` · ${gapsFilled} filled` : ''} |`);
+  lines.push('');
+
+  // ── Table of contents ─────────────────────────────────────────────────────
+  lines.push('## Table of contents');
+  lines.push('');
+  const tocItems = [
+    { title: 'Suggested reading order',   id: 'suggested-reading-order' },
+    { title: 'Primary application flows', id: 'primary-application-flows' },
+    { title: 'Architecture overview',     id: 'architecture-overview' },
+    { title: 'Entry points',              id: 'entry-points' },
+    { title: 'Watch zones',               id: 'watch-zones' },
+    { title: 'Background processes',       id: 'background-processes' },
+    { title: 'External adapters',          id: 'external-adapters' },
+    { title: 'Dead code',                 id: 'dead-code' },
+    { title: 'Module map',                id: 'module-map' },
+    { title: 'Tech stack',                id: 'tech-stack' },
+  ];
+  if (Object.keys(features).length > 0) tocItems.push({ title: 'Feature inventory', id: 'feature-inventory' });
+  if (commentIntel?.modules?.some(m => m.purpose || m.techDebt)) tocItems.push({ title: 'Comment intelligence', id: 'comment-intelligence' });
+
+  tocItems.forEach((item, i) => lines.push(`${i + 1}. [${item.title}](#${item.id})`));
+  lines.push('');
+
+  // ── Suggested reading order ────────────────────────────────────────────────
+  lines.push('## Suggested reading order');
+  lines.push('');
+
+  // Detect entry points with confidence scores
+  const { discoverPrimaryFlows } = require('../analysis/flow-discovery');
+  const flows = store ? discoverPrimaryFlows(store, 5, 4) : [];
+  const graphCoverage = graph.stats?.coverage || 0;
+  const entryPointsDetected = store ? store.getEntryPoints() : detectEntryPoints(nodes, readPackageJson(graph.rootDir), graphCoverage);
+  const sortedEntries = entryPointsDetected.sort((a, b) => b.confidence - a.confidence);
+
+  if (sortedEntries.length === 0) {
+    lines.push('*No entry points detected. Consider marking a file with `@main` comment or setting `main` field in package.json.*');
+  } else {
+    const topEntry = sortedEntries[0];
+    const confidence = topEntry.confidence;
+    const confLabel = confidenceLabel(confidence);
+
+    lines.push(`**Entry point confidence: ${confidence}% (${confLabel})**`);
+    lines.push('');
+
+    if (confidence >= 80) {
+      // High confidence: show single reading order
+      const readingOrder = store ? store.getReadingOrder(12) : generateReadingOrder(topEntry.filePath, nodes, flows, 12);
+      lines.push(`### Start here → \`${topEntry.filePath}\``);
+      lines.push(`Detected via: ${topEntry.detectionMethod} (${topEntry.reason})`);
+      lines.push('');
+      for (let i = 0; i < readingOrder.length; i++) {
+        const item = readingOrder[i];
+        const file = typeof item === 'string' ? item : item.file_path;
+        const summary = (typeof item === 'object' && item.summary) ? item.summary : (summaries[file] || '(no summary)');
+        lines.push(`${i + 1}. **\`${file}\`** — ${summary.split('\n')[0]}`);
+      }
+      lines.push('');
+      lines.push('> Once you understand these files, trace imports to explore the rest of the codebase.');
+    } else if (confidence >= 50) {
+      // Moderate confidence: show primary + alternative
+      lines.push(`### Option A (${confidence}% confidence) → \`${topEntry.filePath}\``);
+      lines.push(`Detected via: ${topEntry.detectionMethod} (${topEntry.reason})`);
+      lines.push('');
+      const readingOrder1 = store ? store.getReadingOrder(10) : generateReadingOrder(topEntry.filePath, nodes, flows, 10);
+      for (let i = 0; i < readingOrder1.length; i++) {
+        const item = readingOrder1[i];
+        const file = typeof item === 'string' ? item : item.file_path;
+        lines.push(`${i + 1}. **\`${file}\`**`);
+      }
+      lines.push('');
+      if (sortedEntries.length > 1) {
+        const alt = sortedEntries[1];
+        lines.push(`### Option B (${alt.confidence}% confidence) → \`${alt.filePath}\``);
+        lines.push(`Detected via: ${alt.detectionMethod} (${alt.reason})`);
+        lines.push('');
+        const readingOrder2 = store ? store.getReadingOrder(10) : generateReadingOrder(alt.filePath, nodes, flows, 10);
+        for (let i = 0; i < readingOrder2.length; i++) {
+          const item = readingOrder2[i];
+          const file = typeof item === 'string' ? item : item.file_path;
+          lines.push(`${i + 1}. **\`${file}\`**`);
+        }
+        lines.push('');
+      }
+      lines.push('> **Tip:** If neither option matches your actual code flow, check the [Entry points](#entry-points) section for other detected entries.');
+    } else {
+      // Low confidence: show multiple options + manual selector
+      lines.push('**Multiple entry points detected. Choose the one that matches your deployment:**');
+      lines.push('');
+      for (let i = 0; i < Math.min(3, sortedEntries.length); i++) {
+        const entry = sortedEntries[i];
+        lines.push(`### Option ${String.fromCharCode(65 + i)} (${entry.confidence}% confidence) → \`${entry.filePath}\``);
+        lines.push(`Detected via: ${entry.detectionMethod} (${entry.reason})`);
+        lines.push('');
+        const order = store ? store.getReadingOrder(8) : generateReadingOrder(entry.filePath, nodes, flows, 8);
+        for (let j = 0; j < order.length; j++) {
+          const item = order[j];
+          const file = typeof item === 'string' ? item : item.file_path;
+          lines.push(`${j + 1}. **\`${file}\`**`);
+        }
+        lines.push('');
+      }
+      lines.push('> **Graph coverage is low.** Run `wednesday-skills map --full` to improve entry point detection accuracy.');
+    }
+  }
+  lines.push('');
+
+  // ── Primary application flows ──────────────────────────────────────────────
+  lines.push('## Primary application flows');
+  lines.push('');
+  lines.push('> Traced functional paths from entry points to core logic. Read these to understand the execution lifecycle.');
+  lines.push('');
+
+  if (flows.length > 0) {
+    for (const flow of flows) {
+      lines.push(`### 🏁 ${flow.entry}`);
+      lines.push(`${flow.description}`);
+      lines.push('');
+      const steps = flow.path.split(' -> ');
+      lines.push(`\`\`\`mermaid
+graph LR
+  ${steps.map((step, i) => `step${i}["${path.basename(step)}"]`).join(' --> ')}
+\`\`\``);
+      lines.push('');
+    }
+  } else {
+    lines.push('*No complex functional flows detected. This may be a simple utility or standalone script.*');
+    lines.push('');
+  }
+
+  // ── User Journeys ──────────────────────────────────────────────────────────
+  const journeysPath = path.join(graph.rootDir, '.wednesday', 'journeys.json');
+  if (fs.existsSync(journeysPath)) {
+    try {
+      const { journeys } = JSON.parse(fs.readFileSync(journeysPath, 'utf8'));
+      if (journeys && journeys.length > 0) {
+        lines.push('## User journeys');
+        lines.push('');
+        lines.push('> High-level business flows across the application.');
+        lines.push('');
+        for (const j of journeys) {
+          lines.push(`### 📽️ ${j.name}`);
+          lines.push(`${j.description}`);
+          lines.push('');
+          lines.push(`\`\`\`mermaid
+graph LR
+  ${j.steps.map((s, i) => `s${i}["${s}"]`).join(' --> ')}
+\`\`\``);
+          lines.push('');
+        }
+      }
+    } catch { /* ignore invalid journeys.json */ }
+  }
+
+  // ── Architecture overview ─────────────────────────────────────────────────
+  lines.push('## Architecture overview');
+  lines.push('');
+
+  // Reverse PRD from comment intelligence — what the project actually does, in dev's own words
+  if (commentIntel?.reversePrd) {
+    lines.push('### What this project does');
+    lines.push('');
+    lines.push('> *Derived from developer comments across the codebase — not inferred from code structure.*');
+    lines.push('');
+    lines.push(commentIntel.reversePrd);
+    lines.push('');
+  }
+
+  const { detectArchitecturePattern } = require('../analysis/architecture');
+  const detectedArch = detectArchitecturePattern(nodes, store);
+  
+  const representativeNodes = sampleRepresentativeNodes(nodes, 10, store);
+  if (apiKey && representativeNodes.length > 0) {
+    const arch = await callHaikuArchitecture(representativeNodes, graph.stats);
+    let archText = arch || generateStructuralArchOverview(graph.stats, representativeNodes);
+    lines.push(archText);
+  }
+  lines.push('');
+
+  // ── Scene Inventory (Clean Swift / VIP specific) ──────────────────────────
+  if (detectedArch === 'Clean Swift (VIP)') {
+    lines.push('### Scene inventory');
+    lines.push('');
+    lines.push('> Mapping of visual scenes to their Clean Swift components.');
+    lines.push('');
+    lines.push('| Scene | ViewController | Interactor | Presenter | Router |');
+    lines.push('|-------|----------------|------------|-----------|--------|');
+
+    const scenes = {};
+    const relevantFiles = store ? store.getFilesByPattern('%.swift') : allNodes.map(([f]) => f);
+    for (const file of relevantFiles) {
+      const match = path.basename(file).match(/^(.+)(ViewController|Interactor|Presenter|Router|Worker)\.swift$/);
+      if (match) {
+        const name = match[1];
+        const type = match[2];
+        scenes[name] = scenes[name] || {};
+        scenes[name][type] = file;
+      }
+    }
+
+    for (const [name, files] of Object.entries(scenes).sort()) {
+      if (Object.keys(files).length >= 3) { // Only show scenes with most components
+        const vc = files.ViewController ? `[\`${path.basename(files.ViewController)}\`](#${files.ViewController.replace(/\//g, '').replace(/\./g, '').toLowerCase()})` : '—';
+        const interactor = files.Interactor ? `\`${path.basename(files.Interactor)}\`` : '—';
+        const presenter = files.Presenter ? `\`${path.basename(files.Presenter)}\`` : '—';
+        const router = files.Router ? `\`${path.basename(files.Router)}\`` : '—';
+        lines.push(`| **${name}** | ${vc} | ${interactor} | ${presenter} | ${router} |`);
+      }
+    }
+    lines.push('');
+  }
+
+  // Language breakdown
+  lines.push('### Language breakdown');
+  lines.push('');
+  lines.push('| Language | Files | % |');
+  lines.push('|----------|-------|---|');
+  const totalCount = stats.totalFiles;
+  for (const [lang, count] of Object.entries(stats.byLang || {}).sort((a, b) => b[1] - a[1])) {
+    lines.push(`| ${lang} | ${count} | ${Math.round(count / totalCount * 100)}% |`);
+  }
+  lines.push('');
+
+  // ── Entry points ──────────────────────────────────────────────────────────
+  lines.push('## Entry points');
+  lines.push('');
+  lines.push('> Detected starting points for reading/debugging this codebase. See [Suggested reading order](#suggested-reading-order) for recommended sequence.');
+  lines.push('');
+
+  if (sortedEntries.length === 0) {
+    lines.push('*No entry points detected. Consider marking a file with `@main` comment or setting `main` field in package.json.*');
+  } else {
+    lines.push('| File | Confidence | Method | Details |');
+    lines.push('|------|-----------|--------|---------|');
+    for (const entry of sortedEntries.slice(0, 8)) {
+      const confLabel = confidenceLabel(entry.confidence);
+      lines.push(`| \`${entry.filePath}\` | **${entry.confidence}%** (${confLabel}) | ${entry.detectionMethod} | ${entry.reason} |`);
+    }
+  }
+  lines.push('');
+
+  // ── Watch zones — high-risk + danger zones merged ─────────────────────────
+  lines.push('## Watch zones');
+  lines.push('');
+  lines.push('> Files to read before modifying. Sorted by risk score.');
+  lines.push('');
+  {
+    const highRiskFiles = Object.values(nodes)
+      .filter(n => n.riskScore > 60)
+      .sort((a, b) => b.riskScore - a.riskScore)
+      .slice(0, 12);
+    const dangerSet = new Set((legacyReport?.dangerZones || []).map(d => d.file));
+    const dangerMap = Object.fromEntries((legacyReport?.dangerZones || []).map(d => [d.file, d]));
+
+    if (highRiskFiles.length > 0) {
+      lines.push('| File | Score | Dependents | Flags |');
+      lines.push('|------|-------|------------|-------|');
+      for (const n of highRiskFiles) {
+        const br  = blastRadius(n.file, nodes);
+        const dep = br.transitive > br.direct ? `${br.direct}+${br.transitive - br.direct}t` : `${br.direct}`;
+        const dz  = dangerSet.has(n.file) ? ' ⚠️ danger' : '';
+        const band = scoreMap[n.file]?.band || '?';
+        lines.push(`| \`${n.file}\` | ${n.riskScore} | ${dep} | ${band}${dz} |`);
+      }
+      // Show any danger zones not already in the high-risk list
+      for (const dz of (legacyReport?.dangerZones || [])) {
+        if (!highRiskFiles.find(n => n.file === dz.file)) {
+          lines.push(`| \`${dz.file}\` | — | — | ⚠️ ${dz.reason} |`);
+        }
+      }
+    } else {
+      lines.push('*No high-risk files detected.*');
+    }
+  }
+  lines.push('');
+
+  // ── Background Processes ────────────────────────────────────────────────────
+  const hasDaemons  = daemonData  && daemonData.total  > 0;
+  if (hasDaemons) {
+    lines.push('## Background processes');
+    lines.push('');
+    lines.push('Scheduled/persistent patterns invisible to import analysis.');
+    lines.push('');
+    lines.push('| Kind | Count | Examples |');
+    lines.push('|------|-------|---------|');
+    for (const [kind, entries] of Object.entries(daemonData.byKind)) {
+      const examples = entries.slice(0, 2).map(e => {
+        const rel = rootDir ? path.relative(rootDir, e.file) : e.file;
+        return e.event ? `\`${e.event}\`` : `\`${path.basename(rel)}:${e.line}\``;
+      }).join(', ');
+      lines.push(`| ${kind} | ${entries.length} | ${examples} |`);
+    }
+    lines.push('');
+  }
+
+  // ── External Adapters ──────────────────────────────────────────────────────
+  const hasAdapters = adapterData && adapterData.total > 0;
+  if (hasAdapters) {
+    lines.push('## External adapters');
+    lines.push('');
+    lines.push('Service boundaries — mocking points for tests.');
+    lines.push('');
+    lines.push('| Category | Libraries | Files |');
+    lines.push('|----------|-----------|-------|');
+    for (const [kind, libraries] of Object.entries(adapterData.byKind)) {
+      const libs      = Object.keys(libraries).join(', ');
+      const fileCount = Object.values(libraries).reduce((s, arr) => s + arr.length, 0);
+      lines.push(`| ${kind} | ${libs} | ${fileCount} |`);
+    }
+    lines.push('');
+  }
+
+  // ── Dead code ──────────────────────────────────────────────────────────────
+  lines.push('## Dead code');
+  lines.push('');
+  if (deadFiles.length > 0 || unusedExportCount > 0) {
+    if (deadFiles.length > 0) {
+      lines.push(`**${deadFiles.length} unreferenced files** — no importers detected`);
+      lines.push('');
+      lines.push('| File | Lang | Risk |');
+      lines.push('|------|------|------|');
+      for (const f of deadFiles.slice(0, 15)) {
+        const n    = nodes[f] || {};
+        const risk = riskByFile[f] === 'high' ? '🔴' : riskByFile[f] === 'low' ? '🟢' : '⚪';
+        lines.push(`| \`${f}\` | ${n.lang || '?'} | ${risk} ${riskByFile[f] || '?'} |`);
+      }
+      if (deadFiles.length > 15) lines.push(`| _…+${deadFiles.length - 15} more_ | | |`);
+      lines.push('');
+    }
+    if (unusedExportCount > 0) {
+      const topUnused = Object.entries(unusedExports || {}).slice(0, 8);
+      lines.push(`**${unusedExportCount} unused exports** — exported but never imported`);
+      lines.push('');
+      lines.push('| File | Exports |');
+      lines.push('|------|---------|');
+      for (const [file, exports] of topUnused) {
+        lines.push(`| \`${file}\` | ${(exports || []).slice(0, 4).join(', ')} |`);
+      }
+      if (unusedExportCount > 8) lines.push(`| _…+${unusedExportCount - 8} more files_ | |`);
+      lines.push('');
+    }
+  } else {
+    lines.push('> No dead code detected — every file is imported and every export is used.');
+    lines.push('');
+  }
+
+  // ── Module map ────────────────────────────────────────────────────────────
+  if (communityGroup) {
+    lines.push('## Logical module map');
+    lines.push('');
+    lines.push('> Files grouped by logical interaction (Louvain community detection).');
+    lines.push('');
+    lines.push('| Community | Representative Files | Avg Risk | Primary Role | Purpose |');
+    lines.push('|-----------|----------------------|----------|--------------|---------|');
+
+    for (const [cid, members] of Object.entries(communityGroup).sort((a, b) => b[1].length - a[1].length)) {
+      const avgRisk = Math.round(members.reduce((s, [, n]) => s + n.riskScore, 0) / members.length);
+      const riskIcon = avgRisk >= 61 ? '🔴' : avgRisk >= 31 ? '🟡' : '🟢';
+      
+      const roles = members.reduce((acc, [, n]) => {
+        const r = classifyRole(n.file, n);
+        acc[r] = (acc[r] || 0) + 1;
+        return acc;
+      }, {});
+      const primaryRole = Object.entries(roles).sort((a, b) => b[1] - a[1])[0][0];
+
+      const reps = members
+        .sort((a, b) => (b[1].importedBy?.length || 0) - (a[1].importedBy?.length || 0))
+        .slice(0, 3)
+        .map(([f]) => `\`${path.basename(f)}\``)
+        .join(', ');
+
+      const memberCount = members.length > 3 ? ` (+${members.length - 3} more)` : '';
+      
+      // Look for a module-level description in commentIntel if any member's dir has one
+      const dirs = new Set(members.map(([f]) => path.dirname(f)));
+      let purpose = null;
+      for (const d of dirs) {
+        if (commentByDir.has(d)) {
+          purpose = commentByDir.get(d).purpose;
+          break;
+        }
+      }
+      if (!purpose) {
+        purpose = `Core ${primaryRole} logic for ${Object.keys(roles).length} types.`;
+      }
+
+      lines.push(`| **Tier ${cid}** | ${reps}${memberCount} | ${riskIcon} ${avgRisk} | ${primaryRole} | ${purpose} |`);
+    }
+  } else {
+    // Fallback to Directory map
+    lines.push('## Module map');
+    lines.push('');
+    lines.push('> One row per directory.');
+    lines.push('');
+    lines.push('| Directory | Files | Avg risk | Debt | Type | Purpose |');
+    lines.push('|-----------|-------|----------|------|------|---------|');
+
+    const byDir = groupByDir(allNodes);
+    for (const [dir, dirNodes] of Object.entries(byDir).sort()) {
+      const intel = commentByDir.get(dir);
+      const avgRisk = Math.round(dirNodes.reduce((s, [, n]) => s + n.riskScore, 0) / dirNodes.length);
+      const riskIcon = avgRisk >= 61 ? '🔴' : avgRisk >= 31 ? '🟡' : '🟢';
+      let debt = intel?.techDebt && intel.techDebt !== 'none' ? `**${intel.techDebt.toUpperCase()}**` : '—';
+      let type = intel?.isBizFeature === true ? '`biz`' : intel?.isBizFeature === false ? '`infra`' : '—';
+      
+      let purpose = intel?.purpose ? intel.purpose.split('.')[0] : null;
+      if (!purpose) {
+        const roles = dirNodes.reduce((acc, [, n]) => {
+          const r = classifyRole(n.file, n);
+          acc[r] = (acc[r] || 0) + 1;
+          return acc;
+        }, {});
+        const roleStr = Object.entries(roles).map(([r, c]) => `${c} ${r}${c > 1 ? 's' : ''}`).join(', ');
+        purpose = `Contains ${roleStr}`;
+      }
+      lines.push(`| \`${dir}\` | ${dirNodes.length} | ${riskIcon} ${avgRisk} | ${debt} | ${type} | ${purpose} |`);
+    }
+  }
+  lines.push('');
+
+  // ── Tech stack ─────────────────────────────────────────────────────────────
+  // stack/pkgJson/frameworks already computed above before the LLM path
+  lines.push('## Tech stack');
+  lines.push('');
+  lines.push('| Dimension | Details |');
+  lines.push('|-----------|---------|');
+  if (stack.platform)           lines.push(`| Platform | ${stack.platform} |`);
+  if (stack.languages.length)   lines.push(`| Languages | ${stack.languages.join(', ')} |`);
+  if (stack.frameworks.length)  lines.push(`| Frameworks | ${stack.frameworks.join(', ')} |`);
+  if (stack.libraries.length)   lines.push(`| Key Libraries | ${stack.libraries.slice(0, 15).join(', ')} |`);
+  lines.push('');
+
+  // ── Feature inventory ──────────────────────────────────────────────────────
+  if (Object.keys(features).length > 0) {
+    lines.push('## Feature inventory');
+    lines.push('');
+    lines.push('> Inferred business domains from codebase structure.');
+    lines.push('');
+    for (const [domain, files] of Object.entries(features)) {
+      lines.push(`- **${domain}:** ${files.slice(0, 10).map(f => `\`${f}\``).join(', ')}`);
+    }
+    lines.push('');
+  }
+
+  // ── Comment intelligence ──────────────────────────────────────────────────
+  if (commentIntel?.modules?.some(m => m.purpose || m.techDebt)) {
+    lines.push('## Comment intelligence');
+    lines.push('');
+    lines.push('> Enriched from developer comments — TODOs, FIXMEs, HACKs, and explanations.');
+    lines.push('');
+    appendCommentIntelSection(lines, commentIntel);
+  }
+
+  // ── Tech debt (top 5 only, compact) ──────────────────────────────────────
+  if (legacyReport?.techDebt?.length > 0) {
+    lines.push('## Tech debt');
+    lines.push('');
+    lines.push('| File | Bug fixes | Age | Priority |');
+    lines.push('|------|-----------|-----|----------|');
+    for (const td of legacyReport.techDebt.slice(0, 8)) {
+      lines.push(`| \`${td.file}\` | ${td.bugFixes} | ${td.age} | **${td.priority}** |`);
+    }
+    if (legacyReport.techDebt.length > 8) lines.push(`| _…+${legacyReport.techDebt.length - 8} more_ | | | |`);
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push('*Generated by wednesday-skills map — graph analysis only, no raw source read*');
+
+  const content = lines.join('\n');
+  const outPath = path.join(codebaseDir, 'MASTER.md');
+  fs.mkdirSync(codebaseDir, { recursive: true });
+  fs.writeFileSync(outPath, content);
+  return outPath;
+}
+
+/**
+ * Classify a file path into a role hint for onboarding notes
+ */
+function classifyRole(file, node) {
+  const f = file.toLowerCase();
+  const name = path.basename(f, path.extname(f));
+  if (node.meta?.isController) return 'controller';
+  if (node.meta?.isProvider) return 'di-provider';
+  if (node.isEntryPoint) return 'entry-point';
+  if (node.isBarrel) return 'barrel-export';
+  if (/\.test\.|\.spec\./.test(f)) return 'test';
+  if (/\/(hooks?|use[A-Z])/.test(file) || /^use[A-Z]/.test(name)) return 'react-hook';
+  if (/\/(components?|views?|screens?|pages?)\//.test(f) || /component|view|screen|page/i.test(name)) return 'ui-component';
+  if (/\/service[s]?\//.test(f) || /service/i.test(name)) return 'service';
+  if (/\/util[s]?\/|\/helper[s]?\/|\/lib\//.test(f) || /util|helper/i.test(name)) return 'utility';
+  if (/\/model[s]?\/|\/entit[y|ies]\/|\/schema[s]?\//.test(f)) return 'data-model';
+  if (/\/config[s]?\/|\/constant[s]?\/|\/settings?\//.test(f) || /config|constant/i.test(name)) return 'config';
+  if (/\/routes?\/|\/router\//.test(f) || /route|router/i.test(name)) return 'router';
+  if (/\/middleware\//.test(f) || /middleware/i.test(name)) return 'middleware';
+  if (/\/store[s]?\/|\/redux\/|\/context\//.test(f)) return 'state-management';
+  if (/\.graphql$|\.gql$/.test(f)) return 'graphql-schema';
+  if (node.lang === 'go')     return 'go-module';
+  if (node.lang === 'kotlin') return 'android-module';
+  if (node.lang === 'swift') {
+    if (node.meta?.isViewController) return 'ios-viewcontroller';
+    if (node.meta?.isView)           return 'swiftui-view';
+    if (node.meta?.isObservableObject) return 'ios-viewmodel';
+    return 'ios-module';
+  }
+  return 'module';
+}
+
+const ROLE_ONBOARDING = {
+  'controller':       'Handles HTTP requests for this domain. Start here to understand the API surface.',
+  'di-provider':      'Injectable service — look at what it provides and who injects it.',
+  'entry-point':      'Application entry. Read this first to understand bootstrapping.',
+  'barrel-export':    'Re-exports from this directory. Use the exports list to see what\'s public.',
+  'test':             'Test file — read alongside the module it tests.',
+  'react-hook':       'Custom React hook. Check "Imported by" to see which components depend on it.',
+  'ui-component':     'UI component — renders directly to screen. Check its props via exports and which pages include it.',
+  'service':          'Business logic service. The most likely place to add features for this domain.',
+  'utility':          'Shared utility — pure functions with no side effects (ideally). Safe to read without context.',
+  'data-model':       'Data shape definition. Changes here affect everything in "Imported by".',
+  'config':           'Configuration constants. Changes affect the whole application.',
+  'router':           'Route definitions — shows what URLs/endpoints this area owns.',
+  'middleware':       'Request/response pipeline step. Runs on every matched request.',
+  'state-management': 'Global state store/context. Changes here cascade to all consumers.',
+  'graphql-schema':   'GraphQL type definitions. Changes require coordinated client + server updates.',
+  'go-module':        'Go package — exported symbols are capitalised identifiers.',
+  'android-module':   'Kotlin/Android module — check Activity/Fragment lifecycle usage.',
+  'module':           'Internal module. Check exports and "Imported by" to understand its role.',
+};
+
+/**
+ * Full file section — every detail
+ */
+
+
+function appendCommentIntelSection(lines, intel) {
+  const enriched = intel.modules.filter(m => m.purpose || m.techDebt);
+  if (enriched.length === 0) return;
+
+  // Biz features vs infra split
+  const biz   = enriched.filter(m => m.isBizFeature === true);
+  const infra  = enriched.filter(m => m.isBizFeature === false);
+  const unknown = enriched.filter(m => m.isBizFeature === null);
+
+  if (biz.length > 0) {
+    lines.push('### Business features');
+    lines.push('');
+    lines.push('| Module | Purpose | Tech debt |');
+    lines.push('|--------|---------|-----------|');
+    for (const m of biz) {
+      const debt = m.techDebt && m.techDebt !== 'none'
+        ? `**${m.techDebt.toUpperCase()}**` : m.techDebt || '—';
+      lines.push(`| \`${m.dir}/\` | ${m.purpose || '—'} | ${debt} |`);
+    }
+    lines.push('');
+  }
+
+  if (infra.length > 0) {
+    lines.push('### Infrastructure modules');
+    lines.push('');
+    lines.push('| Module | Purpose | Tech debt |');
+    lines.push('|--------|---------|-----------|');
+    for (const m of infra) {
+      const debt = m.techDebt && m.techDebt !== 'none'
+        ? `**${m.techDebt.toUpperCase()}**` : m.techDebt || '—';
+      lines.push(`| \`${m.dir}/\` | ${m.purpose || '—'} | ${debt} |`);
+    }
+    lines.push('');
+  }
+
+  if (unknown.length > 0) {
+    lines.push('### Other modules');
+    lines.push('');
+    lines.push('| Module | Purpose | Tech debt |');
+    lines.push('|--------|---------|-----------|');
+    for (const m of unknown) {
+      const debt = m.techDebt && m.techDebt !== 'none'
+        ? `**${m.techDebt.toUpperCase()}**` : m.techDebt || '—';
+      lines.push(`| \`${m.dir}/\` | ${m.purpose || '—'} | ${debt} |`);
+    }
+    lines.push('');
+  }
+
+  // Improvement ideas — all modules that have them
+  const withIdeas = enriched.filter(m => m.ideas?.length > 0);
+  if (withIdeas.length > 0) {
+    lines.push('### Improvement ideas from comments');
+    lines.push('');
+    for (const m of withIdeas) {
+      lines.push(`**\`${m.dir}/\`**`);
+      for (const idea of m.ideas) lines.push(`- ${idea}`);
+      lines.push('');
+    }
+  }
+
+  // Global tag stats
+  if (intel.summary?.byType && Object.keys(intel.summary.byType).length > 0) {
+    lines.push('### Tag breakdown');
+    lines.push('');
+    lines.push('| Tag | Count |');
+    lines.push('|-----|-------|');
+    for (const [tag, count] of Object.entries(intel.summary.byType).sort((a, b) => b[1] - a[1])) {
+      lines.push(`| \`${tag}\` | ${count} |`);
+    }
+    lines.push('');
+  }
+}
+
+function riskLabel(score) {
+  if (score >= 81) return 'Critical';
+  if (score >= 61) return 'High';
+  if (score >= 31) return 'Medium';
+  return 'Low';
+}
+
+function generateStructuralArchOverview(stats, highValue) {
+  const langs = Object.entries(stats.byLang || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([l, c]) => `${l} (${c} files)`)
+    .join(', ');
+
+  return `${stats.totalFiles} files across ${langs}. ${stats.totalEdges} dependency edges tracked. ${highValue.length} high-value modules (entry points or widely imported). ${stats.highRiskFiles} files with risk score above 60.`;
+}
+
+function sampleRepresentativeNodes(nodes, maxCount = 10, store = null) {
+  if (store) {
+    const important = store.getReadingOrder(maxCount * 3);
+    // Mix top tier with some from lower down for variety? 
+    // For now, let's just take the top ones as targets for LLM-based architecture summary
+    return important.map(i => ({ file: i.file_path, imports: [], importedBy: [], riskScore: i.importance_score }));
+  }
+  const allNodes = Object.values(nodes);
+  const layerPatterns = [
+    { name: 'Interactor', re: /Interactor/ },
+    { name: 'Presenter', re: /Presenter/ },
+    { name: 'Router', re: /Router/ },
+    { name: 'ViewController', re: /ViewController/ },
+    { name: 'Service', re: /Service/ },
+    { name: 'Repository', re: /Repository/ },
+    { name: 'Controller', re: /\.controller\./ },
+    { name: 'Middleware', re: /middleware/i },
+    { name: 'AR', re: /ar|arkit/i },
+    { name: 'Social', re: /sqwid|post|feed/i },
+  ];
+
+  const samples = [];
+  for (const pattern of layerPatterns) {
+    const layerFiles = allNodes.filter(n => pattern.re.test(n.file) && !n.isBarrel);
+    if (layerFiles.length > 0) {
+      // Pick the most "typical" one (median risk score)
+      layerFiles.sort((a, b) => a.riskScore - b.riskScore);
+      samples.push(layerFiles[Math.floor(layerFiles.length / 2)]);
+    }
+  }
+
+  // Fill remaining slots with high-risk files
+  if (samples.length < maxCount) {
+    const highRisk = allNodes
+      .filter(n => !samples.includes(n))
+      .sort((a, b) => b.riskScore - a.riskScore)
+      .slice(0, maxCount - samples.length);
+    samples.push(...highRisk);
+  }
+
+  return samples.slice(0, maxCount);
+}
+
+// ── LLM-written MASTER.md ─────────────────────────────────────────────────────
+
+/**
+ * Build a compact context bundle (target: ~1000 tokens) from all collected data.
+ * This becomes the single input to the LLM that writes the full MASTER.md.
+ */
+function buildCompactContext(graph, summaries, scoreMap, deadFiles, unusedExports,
+  daemonData, adapterData, features, legacyReport, flows, insights, stack, entryPointsDetected = [],
+  communityGroup = null) {
+
+  const nodes    = graph.nodes;
+  const allNodes = Object.entries(nodes).filter(([, n]) => !n.error);
+
+  // Band distribution
+  const bands = { critical: 0, risky: 0, moderate: 0, safe: 0 };
+  for (const s of Object.values(scoreMap)) {
+    const b = s.band?.toLowerCase();
+    if (b && bands[b] !== undefined) bands[b]++;
+  }
+
+  // Top risk files — name, role, score, first sentence of summary
+  const topRisk = allNodes
+    .map(([file, node]) => ({
+      file: path.relative(graph.rootDir || '', file) || file,
+      role: node.role || classifyRole(file, node),
+      score: scoreMap[file]?.score || node.riskScore || 0,
+      summary: (summaries[file] || '').split('.')[0],
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12);
+
+  // Entry points with confidence scores
+  const entries = allNodes
+    .filter(([, n]) => n.isEntryPoint)
+    .map(([file]) => ({
+      file: path.relative(graph.rootDir || '', file) || file,
+      summary: (summaries[file] || '').split('.')[0],
+    }));
+
+  // Entry points with confidence (Phase 5)
+  const entriesWithConfidence = entryPointsDetected.slice(0, 5).map(e => ({
+    file: path.relative(graph.rootDir || '', e.filePath) || e.filePath,
+    confidence: e.confidence,
+    method: e.detectionMethod,
+    reason: e.reason,
+  }));
+
+  // Daemons — kind + count + top events
+  const daemonSummary = daemonData ? Object.entries(daemonData.byKind || {}).map(([kind, items]) => ({
+    kind,
+    count: items.length,
+    examples: items.slice(0, 3).map(e => e.event || path.basename(e.file || '')).filter(Boolean),
+  })) : [];
+
+  // Adapters — category + libraries
+  const adapterSummary = adapterData ? Object.entries(adapterData.byKind || {}).map(([kind, libs]) => ({
+    kind,
+    libraries: Object.keys(libs),
+  })) : [];
+
+  // Primary flows (abbreviated)
+  const flowSummary = (flows || []).slice(0, 4).map(f => {
+    const steps = f.path.split(' -> ').map(s => path.basename(s));
+    return steps.join(' → ');
+  });
+
+  // Top tech debt
+  const debtFiles = (legacyReport?.techDebt || []).slice(0, 4).map(td => td.file);
+
+  return {
+    project:    path.basename(graph.rootDir || 'unknown'),
+    platform:   stack?.platform || null,
+    languages:  Object.entries(graph.stats.byLang || {}).sort((a, b) => b[1] - a[1]).map(([l, c]) => `${l}(${c})`),
+    stats: {
+      files:    allNodes.length,
+      edges:    graph.stats.totalEdges,
+      bands,
+    },
+    entryPoints:    entries,
+    entryPointsWithConfidence: entriesWithConfidence,
+    topRiskFiles:   topRisk,
+    daemons:        daemonSummary,
+    adapters:       adapterSummary,
+    features:       Object.keys(features),
+    deadCode: {
+      files:   deadFiles.length,
+      exports: Object.keys(unusedExports || {}).length,
+    },
+    circularDeps: {
+      logic:      (legacyReport?.circularDeps || []).filter(c => c.type === 'Logic').length,
+      structural: (legacyReport?.circularDeps || []).filter(c => c.type === 'Structural').length,
+    },
+    primaryFlows: flowSummary,
+    techDebtFiles: debtFiles,
+    healthNarrative: insights?.healthNarrative || null,
+    communities: communityGroup ? Object.entries(communityGroup).map(([cid, members]) => ({
+      id: cid,
+      size: members.length,
+      reps: members.slice(0, 5).map(([f]) => path.basename(f)),
+    })) : null,
+  };
+}
+
+/**
+ * Call the LLM with the compact context and get back a full MASTER.md.
+ * Uses Haiku for cost efficiency (~1000 token input → ~1200 token output).
+ */
+async function generateWithLlm(ctx, generatedAt) {
+  const contextStr = JSON.stringify(ctx, null, 2);
+
+  const prompt = `You are a senior engineer writing codebase documentation. Given the analysis data below, write a concise MASTER.md for the \`${ctx.project}\` project.
+
+DATA:
+${contextStr}
+
+Write the MASTER.md in this exact structure:
+
+# Codebase Intelligence — MASTER.md
+> Generated: ${generatedAt}
+
+## What this does
+[2-3 sentences: what the product is, who uses it, core value. Name specific domains from features list.]
+
+## Platform & stack
+[1-2 sentences: platform, primary language, key frameworks/libraries from adapters.]
+
+## Architecture
+[2-3 sentences: pattern (Clean Swift/VIP, MVC, MVVM, etc.), how data flows, key structural observations.]
+
+## Entry points
+[table with columns: File | Confidence | Method | Reason. Use entryPointsWithConfidence data. Confidence format: "72% (HIGH/MODERATE/LOW)".]
+
+## Suggested reading order
+[numbered list of 10-15 files, starting with the highest-confidence entry point. Include brief reason for each (2-5 words). Show confidence percentage at top: "Entry confidence: X% (METHOD)". If confidence >= 80%, show single list. If 50-79%, show "Option A" and "Option B". If <50%, show multiple options.]
+
+## Watch zones
+| File | Score | Role | Risk reason |
+|------|-------|------|-------------|
+[top 8 from topRiskFiles — explain WHY each is risky in 3-5 words]
+
+## Background processes
+[compact table: Kind | Count | What it does — skip section if daemons array is empty]
+
+## External adapters
+[compact grouped list by category — skip section if adapters array is empty]
+
+## Feature domains
+[comma-separated list of feature names]
+
+## Dead code
+[one sentence summary. Skip if both files and exports are 0.]
+
+---
+*Generated by wednesday-skills map*
+
+Rules:
+- Be direct. No filler phrases like "this file contains" or "this module handles".
+- Name specific files from the data — don't invent file names.
+- Skip any section if the data for it is empty/zero.
+- Keep each section short — developers read this in under 2 minutes.`;
+
+  return callLLM({ model: 'haiku', messages: [{ role: 'user', content: prompt }], maxTokens: 3000, operation: 'master-md' });
+}
+
+async function callHaikuArchitecture(sampleNodes, stats) {
+  const fileContexts = sampleNodes.map(n => {
+    const sigs = n.meta?.signatures ? `\nSignatures:\n${n.meta.signatures.slice(0, 500)}` : '';
+    return `File: ${n.file}\nRole: ${classifyRole(n.file, n)}\nExports: ${n.exports.slice(0, 10).join(', ')}${sigs}`;
+  }).join('\n\n---\n\n');
+
+  const prompt = `Project Stats: ${stats.totalFiles} files, ${stats.totalLines} lines.
+Primary Frameworks: ${stats.techStack}
+
+Analyze these representative files and describe the overall software architecture pattern (e.g., Clean Swift/VIP, MVC, MVVM, Hexagonal). 
+Explain how data flows between these components.
+
+REPRESENTATIVE SAMPLES:
+${fileContexts}
+
+Write 3 concise paragraphs. Focus on structural boundaries and data flow.`;
+
+  return callLLM({ model: 'haiku', messages: [{ role: 'user', content: prompt }], maxTokens: 400, operation: 'arch-overview' });
+}
+
+async function callHaikuProductOrientation(features, sampleNodes) {
+  const domainList = Object.keys(features).join(', ');
+  const fileContexts = sampleNodes.map(n => {
+    const sigs = n.meta?.signatures ? `\nSignatures:\n${n.meta.signatures.slice(0, 300)}` : '';
+    return `File: ${n.file}\nExports: ${n.exports.slice(0, 5).join(', ')}${sigs}`;
+  }).join('\n\n---\n\n');
+
+  const prompt = `Based on the feature domains (${domainList}) and these representative code signatures, write a 2-paragraph "Product Orientation" for a new developer. 
+Identify what this app actually DOES (e.g., social app, fintech, marketplace, AR tool). 
+Describe the core user value and the main business entities (e.g. Users, Orders, Assets).
+Keep it professional but descriptive. No code-speak in the first paragraph.
+
+SAMPLES:
+${fileContexts}
+
+Format: 2 paragraphs of plain text.`;
+
+  return callLLM({ model: 'haiku', messages: [{ role: 'user', content: prompt }], maxTokens: 400, operation: 'product-orientation' });
+}
+
+function classifyRole(file, node) {
+  if (node.isEntryPoint) return 'Entry Point';
+  if (node.isBarrel) return 'Barrel / Index';
+  if (file.includes('Service')) return 'Service / API';
+  if (file.includes('Repository')) return 'Data / Persistence';
+  if (file.includes('View')) return 'UI Component';
+  if (file.includes('Model')) return 'Data Model';
+  if (file.includes('Interactor')) return 'Business Logic (VIP)';
+  if (file.includes('Presenter')) return 'Presentation Logic (VIP)';
+  if (file.includes('Router')) return 'Navigation (VIP)';
+  return 'Utility / Logic';
+}
+
+module.exports = { generateMasterMd, isHighValue, callHaikuProductOrientation, callHaikuArchitecture };
