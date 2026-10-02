@@ -562,3 +562,11 @@ Bug reports and feature requests are welcome via [GitHub Issues](../../issues).
 ## License
 
 MIT © Wednesday Solutions — see [LICENSE](LICENSE) for details.
+
+---
+
+## Author
+
+**Built by Girish Lade** — [ladestack.in](https://ladestack.in)
+
+A collection of AI agent skills for coding assistants (git discipline, PR triage, terminal dashboard, greenfield planning), maintained as part of the LadeStack project collection.
